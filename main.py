@@ -21,9 +21,10 @@ save = pd.read_csv(
 if not os.path.isdir(save):
 	os.mkdir(save)
 # new folder with timestamp
-savedirect = os.path.join(save,str(datt.now())[:-7])
-if not os.path.isdir(savedirect):
-	os.mkdir(savedirect)
+# NOTE: Windows paths can't contain ":" in folder names, so we format a safe timestamp.
+timestamp = datt.now().strftime("%Y-%m-%d_%H-%M-%S")
+savedirect = os.path.join(save, timestamp)
+os.makedirs(savedirect, exist_ok=True)
 # the folder containing all the images
 datafolder = pd.read_csv(
 	os.path.join("Settings","dataFolder.csv")).iloc[0].directory
