@@ -191,8 +191,8 @@ public:
     }
     
     // Get edge position from pixel center
-    EdgePosition getEdgePosition(const PixelCoordinate& pixel_center, int Ks) const {
-        cv::Point2d offset = polar.toCartesian(Ks / 2.0);
+    EdgePosition getEdgePosition(const PixelCoordinate& pixel_center, int window_size) const {
+        cv::Point2d offset = polar.toCartesian(window_size / 2.0);
         EdgePosition pixel_pos = pixel_center.toEdgePosition();
         return EdgePosition(pixel_pos.x + offset.x, pixel_pos.y + offset.y);
     }
@@ -207,31 +207,172 @@ public:
  */
 struct EdgeResult {
     std::vector<EdgePosition> edges;      // Sub-pixel edge positions
-    std::vector<PixelCoordinate> origins;   // Original pixel centers
+    std::vector<PixelCoordinate> origins; // Original pixel centers
     cv::Mat k;                            // Edge strength map (optional, for debug)
     cv::Mat l;                            // Edge distances map (optional, for debug)
     cv::Mat phi;                          // Edge angles map (optional, for debug)
 };
 
-// Note: Image I/O and utility functions are in image_utils.h and file_utils.h
+// ====================================================================
+// ZERNIKE MOMENTS EDGE DETECTION FUNCTIONS
+// ====================================================================
+// Based on: Christian (2017) "Accurate Planetary Limb Localization"
+// and notes on sub-pixel edge detection using Zernike moments
 
-// Main edge detection function
-EdgeResult ghosal_edge_v2(
-    const cv::Mat& img,
-    int Ks,
-    double kmin = 0.0,
-    double kmax = 1000.0,
-    double lmax = 0.5,
-    double phimin = 1.0,
-    bool thresholding = true,
-    bool debug = false,
-    bool mirror = false
+/**
+ * @brief Refine edge positions using Zernike moments sub-pixel detection
+ * 
+ * This is the main entry point for the Christian-Robinson Zernike moments
+ * edge detection algorithm. It takes initial edge points and refines them
+ * to sub-pixel accuracy using small windows around each point.
+ * 
+ * Algorithm:
+ * 1. For each initial edge point, extract a small window (mask)
+ * 2. Convert window coordinates to unit circle
+ * 3. Compute Zernike moments Z_11 and Z_20 for the window
+ * 4. Extract edge angle ψ from A_11: ψ = arg(A_11)
+ * 5. Solve for edge distance l using equations 61 and 62
+ * 6. Convert polar coordinates (l, ψ) back to pixel coordinates
+ * 
+ * @param image Input grayscale image (CV_64F format)
+ * @param initial_edge_points Initial edge points to refine (from Christian-Robinson or other method)
+ * @param window_size Size of window around each point (must be odd, typically 7-9)
+ * @param transition_width Width of edge transition zone w (default: 1.66 * sigma for Gaussian blur)
+ * @param debug If true, returns additional debug information
+ * @return EdgeResult containing refined sub-pixel edge positions
+ */
+EdgeResult refine_edge_positions_with_zernike_moments(
+    const cv::Mat& image,
+    const std::vector<EdgePosition>& initial_edge_points,
+    int window_size = 7,
+    double transition_width = 1.66,
+    bool debug = false
 );
 
-// Utility function to save edge results
-void save_edge_results(const EdgeResult& result, const std::string& filename);
+/**
+ * @brief Compute Zernike polynomial kernels for a given window size
+ * 
+ * Creates the Zernike polynomial kernels T_11 and T_20 for a unit circle
+ * discretized into a window_size × window_size grid.
+ * 
+ * Z_11: T_11(r,θ) = r * exp(jθ) = x + jy
+ * Z_20: T_20(r,θ) = 2r² - 1 = 2(x²+y²) - 1
+ * 
+ * @param window_size Size of the window (must be odd)
+ * @param kernel_z11_real Output: real part of Z_11 kernel
+ * @param kernel_z11_imag Output: imaginary part of Z_11 kernel
+ * @param kernel_z20 Output: Z_20 kernel (real only)
+ */
+void compute_zernike_kernels(
+    int window_size,
+    cv::Mat& kernel_z11_real,
+    cv::Mat& kernel_z11_imag,
+    cv::Mat& kernel_z20
+);
 
-// Utility function to convert EdgeResult to OpenCV format (for visualization)
+/**
+ * @brief Extract a window around a point in the image
+ * 
+ * Extracts a window_size × window_size region centered at the given point.
+ * Handles boundary conditions by padding with edge values.
+ * 
+ * @param image Input image
+ * @param center_point Center point of the window (sub-pixel coordinates)
+ * @param window_size Size of window to extract
+ * @return Extracted window as CV_64F matrix
+ */
+cv::Mat extract_window_around_point(
+    const cv::Mat& image,
+    const EdgePosition& center_point,
+    int window_size
+);
+
+/**
+ * @brief Compute Zernike moments for a window
+ * 
+ * Computes the Zernike moments A_11 and A_20 for a given window using
+ * discrete summation over pixels within the unit circle.
+ * 
+ * A_nm = (n+1)/π * Σ Σ I(u,v) * T_nm(u,v)
+ * 
+ * where the summation is over pixels within the unit circle.
+ * 
+ * @param window Image window (window_size × window_size)
+ * @param kernel_z11_real Real part of Z_11 kernel
+ * @param kernel_z11_imag Imaginary part of Z_11 kernel
+ * @param kernel_z20 Z_20 kernel
+ * @param window_size Size of the window
+ * @return ZernikeMoment containing A_11 (real and imag parts)
+ * @return A_20 value (output parameter)
+ */
+ZernikeMoment compute_zernike_moments_for_window(
+    const cv::Mat& window,
+    const cv::Mat& kernel_z11_real,
+    const cv::Mat& kernel_z11_imag,
+    const cv::Mat& kernel_z20,
+    int window_size,
+    double& A20_out
+);
+
+/**
+ * @brief Extract edge angle from Zernike moment A_11
+ * 
+ * The edge angle ψ is given by: ψ = arg(A_11) = atan2(Im(A_11), Re(A_11))
+ * 
+ * This represents the orientation of the edge in the window.
+ * 
+ * @param A11 Zernike moment A_11
+ * @return Edge angle ψ in radians
+ */
+double extract_edge_angle_from_moment(const ZernikeMoment& A11);
+
+/**
+ * @brief Solve for edge distance l using Christian's equations
+ * 
+ * Solves for the edge distance l from the window center using equations
+ * 61 and 62 from Christian (2017), which model the edge as a linear ramp
+ * with transition width w.
+ * 
+ * Equations:
+ * A'_11 = (k/(24w)) * {3*asin(l+w) - 3*asin(l-w) - ...}
+ * A_20 = (k/(15w)) * [(1-(l-w)²)^(5/2) - (1-(l+w)²)^(5/2)]
+ * 
+ * This function solves for l given A'_11, A_20, and w.
+ * 
+ * @param A11_prime Rotated A_11 (real part only, after rotation)
+ * @param A20 Zernike moment A_20
+ * @param transition_width Width of edge transition zone w
+ * @return Edge distance l (in unit circle coordinates, range: -1 to 1)
+ */
+double solve_edge_distance_from_moments(
+    double A11_prime,
+    double A20,
+    double transition_width
+);
+
+/**
+ * @brief Convert polar coordinates to pixel coordinates
+ * 
+ * Converts from unit circle polar coordinates (l, ψ) to pixel coordinates
+ * in the image, given the window center and size.
+ * 
+ * Formula: [u_i; v_i] = [ũ_i; ṽ_i] + (N*l/2) * [cos(ψ); sin(ψ)]
+ * 
+ * where N is the window size.
+ * 
+ * @param window_center Center of the window in pixel coordinates
+ * @param polar_coord Polar coordinate (l, ψ) in unit circle
+ * @param window_size Size of the window
+ * @return Refined edge position in pixel coordinates
+ */
+EdgePosition convert_polar_to_pixel_coordinates(
+    const EdgePosition& window_center,
+    const PolarCoordinate& polar_coord,
+    int window_size
+);
+
+// Utility functions
+void save_edge_results(const EdgeResult& result, const std::string& filename);
 void edge_result_to_opencv(
     const EdgeResult& result,
     std::vector<cv::Point2d>& edges_out,
@@ -239,4 +380,3 @@ void edge_result_to_opencv(
 );
 
 #endif // ZERNIKE_EDGE_DETECTION_H
-

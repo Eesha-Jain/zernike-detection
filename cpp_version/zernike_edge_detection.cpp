@@ -3,185 +3,369 @@
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
+#include <cmath>
+#include <fstream>
 
 // Use SMALL from image_utils
 extern const double SMALL;
 
+// ====================================================================
+// ZERNIKE KERNEL COMPUTATION
+// ====================================================================
 
-// Main Zernike edge detection function
-EdgeResult ghosal_edge_v2(
-    const cv::Mat& img,
-    int Ks,
-    double kmin,
-    double kmax,
-    double lmax,
-    double phimin,
-    bool thresholding,
-    bool debug,
-    bool mirror
+void compute_zernike_kernels(
+    int window_size,
+    cv::Mat& kernel_z11_real,
+    cv::Mat& kernel_z11_imag,
+    cv::Mat& kernel_z20
+) {
+    // Ensure window_size is odd
+    if (window_size % 2 != 1) {
+        std::cerr << "Warning: window_size must be odd. Adjusting to " << (window_size + 1) << std::endl;
+        window_size = window_size + 1;
+    }
+    
+    // Initialize kernels
+    kernel_z11_real = cv::Mat::zeros(window_size, window_size, CV_64F);
+    kernel_z11_imag = cv::Mat::zeros(window_size, window_size, CV_64F);
+    kernel_z20 = cv::Mat::zeros(window_size, window_size, CV_64F);
+    
+    // Offset to center kernel around (0,0)
+    // For window_size = 7: offset = 1 - 1/7 = 6/7
+    double offset = 1.0 * (1.0 - 1.0 / window_size);
+    
+    // Normalization factor: (n+1)/π
+    double normalization_11 = (1.0 + 1.0) / CV_PI;  // n=1
+    double normalization_20 = (2.0 + 1.0) / CV_PI;  // n=2
+    
+    // Fill kernels
+    for (int i = 0; i < window_size; i++) {
+        for (int j = 0; j < window_size; j++) {
+            // Convert pixel coordinates to unit circle coordinates [-1, 1]
+            double u = 2.0 * j / window_size - offset;  // x-coordinate
+            double v = 2.0 * i / window_size - offset;  // y-coordinate
+            
+            // Only compute within unit circle: u² + v² ≤ 1
+            double r_squared = u * u + v * v;
+            if (r_squared <= 1.0) {
+                // Z_11 polynomial: T_11(r,θ) = r * exp(jθ) = u + jv
+                // Real part: u, Imaginary part: v
+                kernel_z11_real.at<double>(i, j) = u * normalization_11;
+                kernel_z11_imag.at<double>(i, j) = v * normalization_11;
+                
+                // Z_20 polynomial: T_20(r,θ) = 2r² - 1 = 2(u²+v²) - 1
+                kernel_z20.at<double>(i, j) = (2.0 * r_squared - 1.0) * normalization_20;
+            }
+        }
+    }
+}
+
+// ====================================================================
+// WINDOW EXTRACTION
+// ====================================================================
+
+cv::Mat extract_window_around_point(
+    const cv::Mat& image,
+    const EdgePosition& center_point,
+    int window_size
+) {
+    int half_window = window_size / 2;
+    cv::Mat window = cv::Mat::zeros(window_size, window_size, CV_64F);
+    
+    // Get integer pixel coordinates
+    int center_x = static_cast<int>(std::round(center_point.x));
+    int center_y = static_cast<int>(std::round(center_point.y));
+    
+    // Extract window with boundary handling
+    for (int i = 0; i < window_size; i++) {
+        for (int j = 0; j < window_size; j++) {
+            // Calculate pixel coordinates in image
+            int img_x = center_x + (j - half_window);
+            int img_y = center_y + (i - half_window);
+            
+            // Handle boundaries: use edge values
+            img_x = std::max(0, std::min(img_x, image.cols - 1));
+            img_y = std::max(0, std::min(img_y, image.rows - 1));
+            
+            window.at<double>(i, j) = image.at<double>(img_y, img_x);
+        }
+    }
+    
+    return window;
+}
+
+// ====================================================================
+// ZERNIKE MOMENTS COMPUTATION
+// ====================================================================
+
+ZernikeMoment compute_zernike_moments_for_window(
+    const cv::Mat& window,
+    const cv::Mat& kernel_z11_real,
+    const cv::Mat& kernel_z11_imag,
+    const cv::Mat& kernel_z20,
+    int window_size,
+    double& A20_out
+) {
+    // Initialize moments
+    double A11_real = 0.0;
+    double A11_imag = 0.0;
+    double A20 = 0.0;
+    
+    // Compute moments by summing over all pixels in the window
+    // A_nm = Σ Σ I(u,v) * T_nm(u,v)
+    for (int i = 0; i < window_size; i++) {
+        for (int j = 0; j < window_size; j++) {
+            double intensity = window.at<double>(i, j);
+            
+            // Only sum if kernel value is non-zero (within unit circle)
+            double k11_real = kernel_z11_real.at<double>(i, j);
+            double k11_imag = kernel_z11_imag.at<double>(i, j);
+            double k20 = kernel_z20.at<double>(i, j);
+            
+            // Accumulate moments
+            A11_real += intensity * k11_real;
+            A11_imag += intensity * k11_imag;
+            A20 += intensity * k20;
+        }
+    }
+    
+    A20_out = A20;
+    return ZernikeMoment(A11_real, A11_imag);
+}
+
+// ====================================================================
+// EDGE ANGLE EXTRACTION
+// ====================================================================
+
+double extract_edge_angle_from_moment(const ZernikeMoment& A11) {
+    // Edge angle: ψ = arg(A_11) = atan2(Im(A_11), Re(A_11))
+    return std::atan2(A11.imag, A11.real);
+}
+
+// ====================================================================
+// EDGE DISTANCE SOLVING (Christian's Equations 61 & 62)
+// ====================================================================
+
+double solve_edge_distance_from_moments(
+    double A11_prime,
+    double A20,
+    double transition_width
+) {
+    // Equations from Christian (2017), Equations 61 & 62:
+    // A'_11 = (k/(24w)) * {3*asin(l+w) - 3*asin(l-w) - 
+    //          (5(l-w) - 2(l-w)³)√(1-(l-w)²) + 
+    //          (5(l+w) - 2(l+w)³)√(1-(l+w)²)}
+    // A_20 = (k/(15w)) * [(1-(l-w)²)^(5/2) - (1-(l+w)²)^(5/2)]
+    // 
+    // We solve for l using a binary search approach, since the relationship is non-linear.
+    
+    double w = transition_width;
+    
+    // Handle edge cases
+    if (std::abs(A20) < SMALL && std::abs(A11_prime) < SMALL) {
+        return 0.0;  // Edge at center
+    }
+    
+    // Helper function to compute A'_11 and A_20 for a given l
+    auto compute_moments_for_l = [w](double l) -> std::pair<double, double> {
+        double l_plus_w = std::max(-1.0, std::min(1.0, l + w));
+        double l_minus_w = std::max(-1.0, std::min(1.0, l - w));
+        
+        // Compute A_20 (Equation 62)
+        double term1 = std::pow(std::max(0.0, 1.0 - l_minus_w * l_minus_w), 2.5);
+        double term2 = std::pow(std::max(0.0, 1.0 - l_plus_w * l_plus_w), 2.5);
+        double A20_val = (term1 - term2) / (15.0 * w);
+        
+        // Compute A'_11 (Equation 61) - we'll compute this normalized by k
+        double asin_lpw = std::asin(l_plus_w);
+        double asin_lmw = std::asin(l_minus_w);
+        
+        double sqrt1_lmw = std::sqrt(std::max(0.0, 1.0 - l_minus_w * l_minus_w));
+        double sqrt1_lpw = std::sqrt(std::max(0.0, 1.0 - l_plus_w * l_plus_w));
+        
+        double term3 = (5.0 * l_minus_w - 2.0 * std::pow(l_minus_w, 3.0)) * sqrt1_lmw;
+        double term4 = (5.0 * l_plus_w - 2.0 * std::pow(l_plus_w, 3.0)) * sqrt1_lpw;
+        
+        double A11_val = (3.0 * asin_lpw - 3.0 * asin_lmw - term3 + term4) / (24.0 * w);
+        
+        return std::make_pair(A11_val, A20_val);
+    };
+    
+    // Use binary search to find l that minimizes the error
+    double l_min = -1.0 + SMALL;
+    double l_max = 1.0 - SMALL;
+    double best_l = 0.0;
+    double best_error = std::numeric_limits<double>::max();
+    
+    // Binary search with fine resolution
+    int num_iterations = 50;
+    for (int iter = 0; iter < num_iterations; iter++) {
+        double l_test = (l_min + l_max) / 2.0;
+        
+        auto [A11_expected, A20_expected] = compute_moments_for_l(l_test);
+        
+        // If both are near zero, skip
+        if (std::abs(A20_expected) < SMALL) {
+            l_test = (l_test > 0) ? l_test - 0.01 : l_test + 0.01;
+            if (l_test < l_min || l_test > l_max) continue;
+            auto [A11_alt, A20_alt] = compute_moments_for_l(l_test);
+            A11_expected = A11_alt;
+            A20_expected = A20_alt;
+        }
+        
+        if (std::abs(A20_expected) < SMALL) continue;
+        
+        // Estimate k from A_20
+        double k_est = A20 / A20_expected;
+        double A11_expected_scaled = A11_expected * k_est;
+        
+        // Compute error
+        double error = std::abs(A11_prime - A11_expected_scaled);
+        
+        if (error < best_error) {
+            best_error = error;
+            best_l = l_test;
+        }
+        
+        // Update search bounds
+        if (A11_expected_scaled < A11_prime) {
+            l_min = l_test;
+        } else {
+            l_max = l_test;
+        }
+    }
+    
+    // Final refinement around best_l
+    double refine_step = 0.001;
+    for (double l_test = best_l - 0.01; l_test <= best_l + 0.01; l_test += refine_step) {
+        if (l_test < -1.0 + SMALL || l_test > 1.0 - SMALL) continue;
+        
+        auto [A11_expected, A20_expected] = compute_moments_for_l(l_test);
+        if (std::abs(A20_expected) < SMALL) continue;
+        
+        double k_est = A20 / A20_expected;
+        double A11_expected_scaled = A11_expected * k_est;
+        double error = std::abs(A11_prime - A11_expected_scaled);
+        
+        if (error < best_error) {
+            best_error = error;
+            best_l = l_test;
+        }
+    }
+    
+    return best_l;
+}
+
+// ====================================================================
+// COORDINATE CONVERSION
+// ====================================================================
+
+EdgePosition convert_polar_to_pixel_coordinates(
+    const EdgePosition& window_center,
+    const PolarCoordinate& polar_coord,
+    int window_size
+) {
+    // Formula: [u_i; v_i] = [ũ_i; ṽ_i] + (N*l/2) * [cos(ψ); sin(ψ)]
+    // where N is window_size, l is distance, ψ is angle
+    
+    double scale = window_size / 2.0;
+    cv::Point2d offset = polar_coord.toCartesian(scale);
+    
+    return EdgePosition(
+        window_center.x + offset.x,
+        window_center.y + offset.y
+    );
+}
+
+// ====================================================================
+// MAIN ALGORITHM
+// ====================================================================
+
+EdgeResult refine_edge_positions_with_zernike_moments(
+    const cv::Mat& image,
+    const std::vector<EdgePosition>& initial_edge_points,
+    int window_size,
+    double transition_width,
+    bool debug
 ) {
     EdgeResult result;
     
-    // Gather image properties before it's altered
-    int ni = img.rows;
-    int nj = img.cols;
-    
-    // Ks must be odd
-    if (Ks % 2 != 1) {
-        std::cout << "Ks must be odd! Continuing with Ks = Ks-1" << std::endl;
-        Ks = Ks - 1;
+    // Validate inputs
+    if (image.empty()) {
+        std::cerr << "Error: Input image is empty" << std::endl;
+        return result;
     }
     
-    // ====================================================================
-    // STEP 1: CONSTRUCT ZERNIKE POLYNOMIAL KERNELS
-    // ====================================================================
-    cv::Mat Vc11_real = cv::Mat::zeros(Ks, Ks, CV_64F);
-    cv::Mat Vc11_imag = cv::Mat::zeros(Ks, Ks, CV_64F);
-    cv::Mat Vc20 = cv::Mat::zeros(Ks, Ks, CV_64F);
-    
-    double ofs = 1.0 * (1.0 - 1.0 / Ks);  // offset for centering kernel around (0,0)
-    
-    for (int i = 0; i < Ks; i++) {
-        for (int j = 0; j < Ks; j++) {
-            // Normalize pixel coordinates to unit disk [-1, 1]
-            double Kx = 2.0 * j / Ks - ofs;  // x-coordinate in unit circle
-            double Ky = 2.0 * i / Ks - ofs;  // y-coordinate in unit circle
-            
-            // Only compute within unit circle
-            if (Kx * Kx + Ky * Ky <= 1.0) {
-                // Z₁₁ polynomial: T₁₁(r,θ) = r * exp(jθ) = (x + jy) = Kx - j*Ky
-                Vc11_real.at<double>(i, j) = Kx;
-                Vc11_imag.at<double>(i, j) = -Ky;
-                
-                // Z₂₀ polynomial: T₂₀(r,θ) = 2r² - 1 = 2(x²+y²) - 1
-                Vc20.at<double>(i, j) = 2.0 * Kx * Kx + 2.0 * Ky * Ky - 1.0;
-            }
-        }
+    if (initial_edge_points.empty()) {
+        std::cerr << "Error: No initial edge points provided" << std::endl;
+        return result;
     }
     
-    // Mirror image edges to avoid convolution artifacts at boundaries
-    cv::Mat img_processed = img.clone();
-    int border_type = mirror ? cv::BORDER_REFLECT_101 : cv::BORDER_CONSTANT;
-    
-    // ====================================================================
-    // STEP 2: COMPUTE ZERNIKE MOMENTS
-    // ====================================================================
-    double Anorm_1 = (1.0 + 1.0) / CV_PI;  // Normalization factor for n=1
-    double Anorm_2 = (2.0 + 1.0) / CV_PI;  // Normalization factor for n=2
-    
-    // Compute Zernike moments via convolution
-    cv::Mat Vc11_real_norm, Vc11_imag_norm, Vc20_norm;
-    Vc11_real.convertTo(Vc11_real_norm, CV_64F);
-    Vc11_imag.convertTo(Vc11_imag_norm, CV_64F);
-    Vc20.convertTo(Vc20_norm, CV_64F);
-    
-    Vc11_real_norm *= Anorm_1;
-    Vc11_imag_norm *= Anorm_1;
-    Vc20_norm *= Anorm_2;
-    
-    cv::Mat A11_real, A11_imag;
-    cv::filter2D(img_processed, A11_real, CV_64F, Vc11_real_norm, cv::Point(-1, -1), 0, border_type);
-    cv::filter2D(img_processed, A11_imag, CV_64F, Vc11_imag_norm, cv::Point(-1, -1), 0, border_type);
-    
-    cv::Mat A20;
-    cv::filter2D(img_processed, A20, CV_64F, Vc20_norm, cv::Point(-1, -1), 0, border_type);
-    
-    // ====================================================================
-    // STEP 3: EXTRACT EDGE PARAMETERS FROM ZERNIKE MOMENTS
-    // ====================================================================
-    
-    // Calculate edge angle φ
-    cv::Mat A11_real_safe = zero_to_small(A11_real);
-    cv::Mat phi_atan = cv::Mat::zeros(ni, nj, CV_64F);
-    cv::phase(A11_real, A11_imag, phi_atan);  // More accurate than atan
-    
-    // Rotate A₁₁ to align with edge direction: A'₁₁ = Re(A₁₁)*cos(φ) + Im(A₁₁)*sin(φ)
-    cv::Mat cos_phi, sin_phi;
-    cv::cos(phi_atan, cos_phi);
-    cv::sin(phi_atan, sin_phi);
-    cv::Mat Al11 = A11_real.mul(cos_phi) + A11_imag.mul(sin_phi);
-    
-    // Calculate edge distance l from pixel center
-    cv::Mat Al11_safe = zero_to_small(Al11);
-    cv::Mat l;
-    cv::divide(A20, Al11_safe, l);
-    
-    // Clamp l to valid range [-1, 1]
-    cv::Mat l_clamped;
-    extern const double SMALL;  // Defined in image_utils.cpp
-    cv::max(l, -1.0 + SMALL, l_clamped);
-    cv::min(l_clamped, 1.0 - SMALL, l);
-    
-    // Calculate edge strength parameter k
-    cv::Mat l_squared;
-    cv::multiply(l, l, l_squared);
-    cv::Mat one_minus_l_squared = 1.0 - l_squared;
-    cv::Mat denominator;
-    cv::pow(one_minus_l_squared, 1.5, denominator);
-    cv::Mat k = cv::abs(3.0 * Al11 / (2.0 * denominator));
-    
-    // ====================================================================
-    // STEP 4: FILTER EDGE DETECTIONS BY QUALITY CRITERIA
-    // ====================================================================
-    cv::Mat valid = cv::Mat::ones(ni, nj, CV_8U);
-    
-    if (thresholding) {
-        // Create boolean masks for each quality criterion
-        cv::Mat phi_c, l_c, k_c;
-        cv::compare(cv::abs(phi_atan), phimin, phi_c, cv::CMP_GT);
-        cv::compare(cv::abs(l), lmax, l_c, cv::CMP_LT);
-        cv::Mat k_min_mask, k_max_mask;
-        cv::compare(k, kmin, k_min_mask, cv::CMP_GT);
-        cv::compare(k, kmax, k_max_mask, cv::CMP_LT);
-        cv::bitwise_and(k_min_mask, k_max_mask, k_c);
-        
-        // Combine all conditions
-        cv::bitwise_and(phi_c, l_c, valid);
-        cv::bitwise_and(valid, k_c, valid);
+    // Ensure window_size is odd
+    if (window_size % 2 != 1) {
+        window_size = window_size + 1;
+        std::cout << "Adjusted window_size to " << window_size << " (must be odd)" << std::endl;
     }
     
-    // Extract valid edge points
-    std::vector<EdgePosition> edges;
+    // Step 1: Compute Zernike kernels once (reused for all windows)
+    cv::Mat kernel_z11_real, kernel_z11_imag, kernel_z20;
+    compute_zernike_kernels(window_size, kernel_z11_real, kernel_z11_imag, kernel_z20);
+    
+    // Step 2: Process each initial edge point
+    std::vector<EdgePosition> refined_edges;
     std::vector<PixelCoordinate> origins;
     
-    for (int i = 0; i < ni; i++) {
-        for (int j = 0; j < nj; j++) {
-            if (valid.at<uchar>(i, j)) {
-                double l_val = l.at<double>(i, j);
-                double phi_val = phi_atan.at<double>(i, j);
-                
-                // Create polar coordinate
-                PolarCoordinate polar(l_val, phi_val);
-                
-                // Create pixel coordinate for origin
-                PixelCoordinate pixel_origin(j, i);  // (x, y) = (column, row)
-                
-                // Convert polar coordinates to edge position
-                cv::Point2d offset = polar.toCartesian(Ks / 2.0);
-                EdgePosition edge_pos(
-                    pixel_origin.x + offset.x,
-                    pixel_origin.y + offset.y
-                );
-                
-                edges.push_back(edge_pos);
-                origins.push_back(pixel_origin);
-            }
-        }
+    for (const auto& initial_point : initial_edge_points) {
+        // Step 2a: Extract window around the point
+        cv::Mat window = extract_window_around_point(image, initial_point, window_size);
+        
+        // Step 2b: Compute Zernike moments for this window
+        double A20 = 0.0;
+        ZernikeMoment A11 = compute_zernike_moments_for_window(
+            window, kernel_z11_real, kernel_z11_imag, kernel_z20, window_size, A20
+        );
+        
+        // Step 2c: Extract edge angle ψ from A_11
+        double psi = extract_edge_angle_from_moment(A11);
+        
+        // Step 2d: Rotate A_11 to align with edge direction
+        // A'_11 = Re(A_11)*cos(ψ) + Im(A_11)*sin(ψ)
+        double cos_psi = std::cos(psi);
+        double sin_psi = std::sin(psi);
+        double A11_prime = A11.real * cos_psi + A11.imag * sin_psi;
+        
+        // Step 2e: Solve for edge distance l using Christian's equations
+        double l = solve_edge_distance_from_moments(A11_prime, A20, transition_width);
+        
+        // Step 2f: Create polar coordinate
+        PolarCoordinate polar_coord(l, psi);
+        
+        // Step 2g: Convert back to pixel coordinates
+        EdgePosition refined_edge = convert_polar_to_pixel_coordinates(
+            initial_point, polar_coord, window_size
+        );
+        
+        // Store results
+        refined_edges.push_back(refined_edge);
+        
+        // Store origin (rounded initial point)
+        PixelCoordinate origin(
+            static_cast<int>(std::round(initial_point.x)),
+            static_cast<int>(std::round(initial_point.y))
+        );
+        origins.push_back(origin);
     }
     
-    result.edges = edges;
+    result.edges = refined_edges;
     result.origins = origins;
-    
-    if (debug) {
-        result.k = k;
-        result.l = l;
-        result.phi = phi_atan;
-    }
     
     return result;
 }
 
-// Save edge results to file
+// ====================================================================
+// UTILITY FUNCTIONS
+// ====================================================================
+
 void save_edge_results(const EdgeResult& result, const std::string& filename) {
     std::ofstream file(filename);
     if (!file.is_open()) {
@@ -197,7 +381,6 @@ void save_edge_results(const EdgeResult& result, const std::string& filename) {
     file.close();
 }
 
-// Convert EdgeResult to OpenCV format for visualization
 void edge_result_to_opencv(
     const EdgeResult& result,
     std::vector<cv::Point2d>& edges_out,
@@ -214,4 +397,3 @@ void edge_result_to_opencv(
         origins_out.push_back(origin.toPoint2d());
     }
 }
-

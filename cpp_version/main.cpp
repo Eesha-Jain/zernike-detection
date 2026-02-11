@@ -1,184 +1,148 @@
+/**
+ * @file main.cpp
+ * @brief Main program for Zernike moments edge detection
+ * 
+ * This program:
+ * 1. Loads initial edge points from a JSON file
+ * 2. Refines edge positions using Zernike moments algorithm
+ * 3. Displays the results on the image
+ */
+
 #include "zernike_edge_detection.h"
-#include "image_utils.h"
-#include "file_utils.h"
 #include "helper.h"
+#include "image_utils.h"
 #include <iostream>
-#include <vector>
 #include <string>
-#include <chrono>
+#include <sstream>
 #include <iomanip>
 
-// Filesystem compatibility
-#if __cplusplus >= 201703L && defined(__has_include)
-    #if __has_include(<filesystem>)
-        #include <filesystem>
-        namespace fs = std::filesystem;
-    #elif __has_include(<experimental/filesystem>)
-        #include <experimental/filesystem>
-        namespace fs = std::experimental::filesystem;
-    #else
-        // Fallback to manual path handling
-        #define NO_FILESYSTEM
-    #endif
-#else
-    #define NO_FILESYSTEM
-#endif
-
-std::string get_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d_%H-%M-%S");
-    return ss.str();
-}
-
 int main(int argc, char* argv[]) {
-    std::cout << "Zernike Edge Detection - C++ Version" << std::endl;
-    std::cout << "====================================" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Zernike Moments Edge Detection" << std::endl;
+    std::cout << "========================================" << std::endl;
     
-    // Read settings files
-    std::string settings_dir = "Settings";
+    // Parse command line arguments
+    std::string image_file;
+    std::string json_file;
+    int window_size = 7;           // Default window size
+    double transition_width = 1.66; // Default transition width (for Gaussian blur)
     
-    // Read image info
-    #ifdef NO_FILESYSTEM
-    std::string imageinfo_path = path_join(settings_dir, "imageinfo.csv");
-    #else
-    std::string imageinfo_path = (fs::path(settings_dir) / "imageinfo.csv").string();
-    #endif
-    std::vector<ImageInfo> img_info = read_csv(imageinfo_path);
+    if (argc >= 3) {
+        image_file = argv[1];
+        json_file = argv[2];
+    } else {
+        std::cerr << "Error: Must input values for image_file and json_file" << std::endl;
+    }
     
-    if (img_info.empty()) {
-        std::cerr << "Error: No images to process or could not read imageinfo.csv" << std::endl;
+    // STEP 1: Load Image
+    std::cout << "\n[Step 1] Loading image: " << image_file << std::endl;
+    cv::Mat image = read_image(image_file);
+    if (image.empty()) {
+        std::cerr << "Error: Could not load image " << image_file << std::endl;
+        std::cerr << "Please check that the file exists and is a valid image." << std::endl;
+        return 1;
+    }
+    std::cout << "  ✓ Image loaded successfully" << std::endl;
+    std::cout << "  Image size: " << image.cols << " × " << image.rows << " pixels" << std::endl;
+    std::cout << "  Image type: CV_64F (double precision)" << std::endl;
+    
+
+    // STEP 2: Load Initial Edge Points from JSON
+    std::cout << "\n[Step 2] Loading initial edge points from: " << json_file << std::endl;
+    std::vector<EdgePosition> initial_points = read_edge_points_from_json(json_file);
+    
+    if (initial_points.empty()) {
+        std::cerr << "Error: No initial edge points loaded from JSON file" << std::endl;
+        std::cerr << "Please check that the JSON file exists and has the correct format." << std::endl;
+        return 1;
+    }
+    std::cout << "  ✓ Loaded " << initial_points.size() << " initial edge points" << std::endl;
+    
+
+    // STEP 3: Refine Edge Positions with Zernike Moments
+    std::cout << "\n[Step 3] Refining edge positions with Zernike moments..." << std::endl;
+    std::cout << "  Window size: " << window_size << "×" << window_size << std::endl;
+    std::cout << "  Transition width: " << transition_width << std::endl;
+    std::cout << "  Processing " << initial_points.size() << " edge points..." << std::endl;
+    
+    EdgeResult refined_result = refine_edge_positions_with_zernike_moments(
+        image,
+        initial_points,
+        window_size,
+        transition_width,
+        false  // debug mode
+    );
+    
+    if (refined_result.edges.empty()) {
+        std::cerr << "Error: No refined edge points were generated" << std::endl;
         return 1;
     }
     
-    int ncases = img_info.size();
-    std::cout << "Found " << ncases << " images to process" << std::endl;
+    std::cout << "  ✓ Refined " << refined_result.edges.size() << " edge points to sub-pixel accuracy" << std::endl;
     
-    // Read save directory
-    #ifdef NO_FILESYSTEM
-    std::string save_path = path_join(settings_dir, "saveTo.csv");
-    #else
-    std::string save_path = (fs::path(settings_dir) / "saveTo.csv").string();
-    #endif
-    std::string save_dir = read_single_value_csv(save_path, "directory");
-    
-    if (save_dir.empty()) {
-        std::cerr << "Error: Could not read save directory" << std::endl;
-        return 1;
-    }
-    
-    // Create save directory if it doesn't exist
-    #ifdef NO_FILESYSTEM
-    if (!path_exists(save_dir)) {
-        create_directories(save_dir);
-    }
-    #else
-    if (!fs::exists(save_dir)) {
-        fs::create_directories(save_dir);
-    }
-    #endif
-    
-    // Create timestamped subdirectory
-    std::string timestamp = get_timestamp();
-    #ifdef NO_FILESYSTEM
-    std::string savedirect = path_join(save_dir, timestamp);
-    create_directories(savedirect);
-    #else
-    fs::path savedirect = fs::path(save_dir) / timestamp;
-    fs::create_directories(savedirect);
-    #endif
-    
-    std::cout << "Results will be saved to: " << 
-        #ifdef NO_FILESYSTEM
-        savedirect
-        #else
-        savedirect.string()
-        #endif
-        << std::endl;
-    
-    // Read data folder
-    #ifdef NO_FILESYSTEM
-    std::string datafolder_path = path_join(settings_dir, "dataFolder.csv");
-    #else
-    std::string datafolder_path = (fs::path(settings_dir) / "dataFolder.csv").string();
-    #endif
-    std::string datafolder = read_single_value_csv(datafolder_path, "directory");
-    
-    if (datafolder.empty()) {
-        std::cerr << "Error: Could not read data folder" << std::endl;
-        return 1;
-    }
-    
-    // Process each image
-    for (int c = 0; c < ncases; c++) {
-        std::cout << "\nProcessing image " << (c + 1) << " of " << ncases << ": " << img_info[c].name << std::endl;
-        
-        // Construct full image path
-        #ifdef NO_FILESYSTEM
-        std::string image_path = path_join(datafolder, img_info[c].name);
-        #else
-        std::string image_path = (fs::path(datafolder) / img_info[c].name).string();
-        #endif
-        
-        // Read parameters
-        #ifdef NO_FILESYSTEM
-        std::string pars_path = path_join(settings_dir, img_info[c].gpars);
-        #else
-        std::string pars_path = (fs::path(settings_dir) / img_info[c].gpars).string();
-        #endif
-        std::vector<double> pars = read_external_data(pars_path);
-        
-        if (pars.size() < 7) {
-            std::cerr << "Error: Invalid parameter file for " << img_info[c].name << std::endl;
-            continue;
+    // Calculate statistics
+    if (initial_points.size() == refined_result.edges.size()) {
+        double total_displacement = 0.0;
+        double max_displacement = 0.0;
+        for (size_t i = 0; i < initial_points.size(); i++) {
+            double dx = refined_result.edges[i].x - initial_points[i].x;
+            double dy = refined_result.edges[i].y - initial_points[i].y;
+            double displacement = std::sqrt(dx * dx + dy * dy);
+            total_displacement += displacement;
+            max_displacement = std::max(max_displacement, displacement);
         }
-        
-        int K_s = static_cast<int>(pars[0]);
-        double k_min = pars[1];
-        double k_max = pars[2];
-        double l_max = pars[3];
-        double phi_min = pars[4];
-        double outlier_sigma = pars[5];
-        double blur = pars[6];
-        
-        // Load image
-        cv::Mat img_o = read_image(image_path);
-        if (img_o.empty()) {
-            std::cerr << "Error: Could not load image " << image_path << std::endl;
-            continue;
-        }
-        
-        // Blur image
-        cv::Mat img_f = blur_image(img_o, static_cast<int>(blur));
-        
-        // Detect edges
-        std::cout << "  Detecting edges with K_s=" << K_s << ", k_min=" << k_min 
-                  << ", k_max=" << k_max << ", l_max=" << l_max << ", phi_min=" << phi_min << std::endl;
-        
-        EdgeResult edge_result = ghosal_edge_v2(
-            img_f, K_s, k_min, k_max, l_max, phi_min, true, false, true
-        );
-        
-        std::cout << "  Found " << edge_result.edges.size() << " edge points" << std::endl;
-        
-        // Save results
-        #ifdef NO_FILESYSTEM
-        std::string basename = path_stem(img_info[c].name);
-        std::string savename = path_join(savedirect, basename + ".txt");
-        #else
-        std::string basename = fs::path(img_info[c].name).stem().string();
-        std::string savename = (savedirect / (basename + ".txt")).string();
-        #endif
-        save_edge_results(edge_result, savename);
-        
-        std::cout << "  Saved to: " << savename << std::endl;
+        double avg_displacement = total_displacement / initial_points.size();
+        std::cout << "  Average refinement: " << std::fixed << std::setprecision(3) 
+                  << avg_displacement << " pixels" << std::endl;
+        std::cout << "  Maximum refinement: " << max_displacement << " pixels" << std::endl;
     }
     
-    std::cout << "\nProcessing complete!" << std::endl;
-    std::cout << "Press ENTER to exit...";
-    std::cin.get();
+    
+    // STEP 4: Display Results on Image
+    std::cout << "\n[Step 4] Displaying results on image..." << std::endl;
+    
+    // Load original image for display (try to load as color, fallback to grayscale)
+    cv::Mat display_image = cv::imread(image_file, cv::IMREAD_COLOR);
+    if (display_image.empty()) {
+        // If color load failed, use the grayscale image and convert to BGR
+        display_image = image.clone();
+        // Convert from CV_64F to CV_8U first
+        cv::Mat image_8u;
+        image.convertTo(image_8u, CV_8U);
+        cv::cvtColor(image_8u, display_image, cv::COLOR_GRAY2BGR);
+    } else {
+        // Convert color image to 8-bit if needed
+        if (display_image.depth() != CV_8U) {
+            cv::Mat temp;
+            display_image.convertTo(temp, CV_8U);
+            display_image = temp;
+        }
+    }
+    
+    // Display initial points in green
+    std::cout << "  Drawing initial points (green)..." << std::endl;
+    cv::Mat result_image = display_edge_points_on_image(
+        display_image,
+        initial_points,
+        cv::Scalar(0, 255, 0),  // Green for initial points
+        3,                        // Point radius
+        false,                    // Don't show yet
+        "Zernike Edge Detection"  // Window name
+    );
+    
+    // Display refined points in blue (larger, on top)
+    std::cout << "  Drawing refined points (blue)..." << std::endl;
+    result_image = display_edge_points_on_image(
+        result_image,
+        refined_result.edges,
+        cv::Scalar(255, 0, 0),  // Blue for refined points
+        5,                       // Larger point radius
+        true,                    // Show image now
+        "Zernike Edge Detection - Green: Initial, Blue: Refined"
+    );
+    
+    std::cout << "  ✓ Image displayed" << std::endl;
+    std::cout << "  Press any key in the image window to continue..." << std::endl;
     
     return 0;
 }
-
